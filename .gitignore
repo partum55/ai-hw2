@@ -18,6 +18,7 @@ logs/
 *.onnx
 *.npy
 submission*.csv
+sub_*.csv
 
 # Credentials
 .env

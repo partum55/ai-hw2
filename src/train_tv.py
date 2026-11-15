@@ -45,7 +45,16 @@ ap.add_argument("--out", default="runs")
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--rpn-post-nms", type=int, default=1000, help="frcnn: proposals kept per image after RPN NMS")
 ap.add_argument("--roi-batch", type=int, default=512, help="frcnn: RoIs sampled per image for the box head")
+ap.add_argument("--predict-test", action="store_true", help="also save detections for the test set (runs/testdets_<tag>.npy)")
+ap.add_argument("--no-val", action="store_true", help="skip scoring on val (e.g. when only test detections are needed)")
 ap.add_argument("--viz", type=int, default=0, help="debug: save N augmented training samples with their boxes and exit")
+# --- tuning switches (defaults reproduce the baseline exactly) ---
+ap.add_argument("--frcnn-beta", type=float, default=1 / 9, help="frcnn: smooth-L1 beta of the box head loss (1e-5 ~ plain L1; torchvision default 1/9)")
+ap.add_argument("--anchor-base", type=int, default=32, help="retina: smallest anchor size at P3 (32 = default; 16 reaches the many <32 px objects)")
+ap.add_argument("--focal-alpha", type=float, default=0.25, help="retina: focal loss alpha")
+ap.add_argument("--focal-gamma", type=float, default=2.0, help="retina: focal loss gamma")
+ap.add_argument("--retina-loss", default="l1", choices=["l1", "smooth_l1", "giou", "diou", "ciou"], help="retina: box regression loss")
+ap.add_argument("--fcos-radius", type=float, default=1.5, help="fcos: center-sampling radius (positives = locations within radius x stride of the box centre)")
 ap.add_argument("--limit-train", type=int, default=0, help="debug: stop after N iterations")
 ap.add_argument("--limit-val", type=int, default=0, help="debug: evaluate only the first N frames")
 a = ap.parse_args()
@@ -84,6 +93,27 @@ class DS(torch.utils.data.Dataset):
         return to_tensor(im), tgt, sc, s.ids[i]
 
 
+def patch_losses():
+    """Apply the loss/assignment switches. Each patch is a no-op at its default value."""
+    if a.model == "frcnn" and a.frcnn_beta != 1 / 9:
+        import torch.nn.functional as F
+        from torchvision.models.detection import roi_heads
+
+        def fastrcnn_loss(class_logits, box_regression, labels, regression_targets):  # torchvision's, with a free beta
+            labels = torch.cat(labels, dim=0); regression_targets = torch.cat(regression_targets, dim=0)
+            cls_loss = F.cross_entropy(class_logits, labels)
+            pos = torch.where(labels > 0)[0]; lab = labels[pos]
+            N = class_logits.shape[0]
+            box_regression = box_regression.reshape(N, box_regression.size(-1) // 4, 4)
+            box_loss = F.smooth_l1_loss(box_regression[pos, lab], regression_targets[pos], beta=a.frcnn_beta, reduction="sum")
+            return cls_loss, box_loss / labels.numel()
+        roi_heads.fastrcnn_loss = fastrcnn_loss
+    if a.model == "retina" and (a.focal_alpha, a.focal_gamma) != (0.25, 2.0):
+        from torchvision.models.detection import retinanet
+        from torchvision.ops import sigmoid_focal_loss
+        retinanet.sigmoid_focal_loss = functools.partial(sigmoid_focal_loss, alpha=a.focal_alpha, gamma=a.focal_gamma)
+
+
 def build():
     """COCO-pretrained detector with a fresh 8-class head; inference thresholds set for mAP (low score, up to 500 dets)."""
     size = dict(min_size=(a.min_size - 80, a.min_size - 40, a.min_size + 40, a.min_size + 80, a.min_size),  # multi-scale train; eval uses the last
@@ -98,10 +128,16 @@ def build():
                                         detections_per_img=500, **size)
         m.head.classification_head = RetinaNetClassificationHead(
             256, m.head.classification_head.num_anchors, NC, norm_layer=functools.partial(nn.GroupNorm, 32))
+        m.head.regression_head._loss_type = a.retina_loss
+        if a.anchor_base != 32:  # same 3 sizes x 3 ratios per location as the default, so the pretrained head still fits
+            from torchvision.models.detection.anchor_utils import AnchorGenerator
+            sizes = tuple((int(a.anchor_base * 2 ** i), int(a.anchor_base * 2 ** (i + 1 / 3)), int(a.anchor_base * 2 ** (i + 2 / 3))) for i in range(5))
+            m.anchor_generator = AnchorGenerator(sizes, ((0.5, 1.0, 2.0),) * 5)
     else:
         m = D.fcos_resnet50_fpn(weights=D.FCOS_ResNet50_FPN_Weights.COCO_V1, score_thresh=0.001,
                                 detections_per_img=500, **size)
         m.head.classification_head = FCOSClassificationHead(256, m.head.classification_head.num_anchors, NC)
+        m.center_sampling_radius = a.fcos_radius
     return m.to(dev)
 
 
@@ -118,6 +154,7 @@ if a.viz:  # sanity check of labels after resize + flip
             d.rectangle(b, outline=(0, 255, 0), width=2)
         im.save(f"{a.out}/viz_{k}.jpg"); print("saved", k, len(t["boxes"]), "boxes", im.size)
     raise SystemExit
+patch_losses()
 model = build()
 opt = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=a.lr, momentum=0.9, weight_decay=1e-4)
 total = a.epochs * len(loader)
@@ -157,16 +194,31 @@ for ep in range(start, a.epochs):
         break
 json.dump(log, open(out / "train_log.json", "w"), indent=1)
 
-# ---- evaluation on val with the project protocol -------------------------------------------------------------
-gt = COCO(str(DATA / "val" / "annotations_coco.json"))
-ids = sorted(gt.getImgIds())[: a.limit_val or None]
-vl = torch.utils.data.DataLoader(DS([str(DATA / "val" / gt.imgs[i]["file_name"]) for i in ids], False, ids), batch_size=4,
-                                 num_workers=a.workers, collate_fn=lambda b: tuple(zip(*b)))
-model.eval(); dets, t0 = [], time.time()
-with torch.no_grad(), torch.autocast(dev, enabled=dev == "cuda"):
-    for x, _, scs, iids in vl:
-        for o, sc, iid in zip(model([i.to(dev) for i in x]), scs, iids):
-            for (x1, y1, x2, y2), p, c in zip((o["boxes"] / sc).tolist(), o["scores"].tolist(), o["labels"].tolist()):
-                dets.append(dict(image_id=iid, category_id=c, score=p, bbox=[x1, y1, x2 - x1, y2 - y1]))
-ms = (time.time() - t0) / len(ids) * 1000
-score(gt, dets, ids, a.tag, ms, out_dir=a.out, **{k: v for k, v in vars(a).items() if k not in ("train_list", "out", "tag")})
+# ---- inference helpers + evaluation on val with the project protocol ----------------------------------------------
+def infer(paths, ids):
+    """Detections [dict(image_id, category_id, score, bbox xywh in source pixels)] for the given image files."""
+    dl = torch.utils.data.DataLoader(DS(paths, False, ids), batch_size=4, num_workers=a.workers,
+                                     collate_fn=lambda b: tuple(zip(*b)))
+    out = []
+    model.eval()
+    with torch.no_grad(), torch.autocast(dev, enabled=dev == "cuda"):
+        for x, _, scs, iids in dl:
+            for o, sc, iid in zip(model([i.to(dev) for i in x]), scs, iids):
+                for (x1, y1, x2, y2), p, c in zip((o["boxes"] / sc).tolist(), o["scores"].tolist(), o["labels"].tolist()):
+                    out.append(dict(image_id=iid, category_id=c, score=p, bbox=[x1, y1, x2 - x1, y2 - y1]))
+    return out
+
+
+if a.predict_test:  # image_id = row index in test_images.csv (ensemble.py --split test maps it back to the name)
+    import pandas as pd
+    t = pd.read_csv(DATA / "test_images.csv")
+    d = infer([str(DATA / f) for f in t.file_name], list(range(len(t))))
+    np.save(Path(a.out) / f"testdets_{a.tag}.npy", np.array([[x["image_id"], x["category_id"], x["score"], *x["bbox"]] for x in d], np.float32))
+    print("saved test detections:", len(d))
+if not a.no_val:
+    gt = COCO(str(DATA / "val" / "annotations_coco.json"))
+    ids = sorted(gt.getImgIds())[: a.limit_val or None]
+    t0 = time.time()
+    dets = infer([str(DATA / "val" / gt.imgs[i]["file_name"]) for i in ids], ids)
+    ms = (time.time() - t0) / len(ids) * 1000
+    score(gt, dets, ids, a.tag, ms, out_dir=a.out, **{k: v for k, v in vars(a).items() if k not in ("train_list", "out", "tag")})

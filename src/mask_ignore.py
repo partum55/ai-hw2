@@ -5,7 +5,7 @@ penalise detections there (COCO iscrowd=1), so we also should not teach the mode
 Rule: fill region with gray (114) on the image; drop a label if >50% of its box area is inside a region (~1% of boxes).
 Frames without ignore regions are symlinked (no re-encode). Val is left untouched: it is scored with iscrowd (eval_coco.py).
 
-Usage: python src/mask_ignore.py --stride 3      (writes DATA/../yolo_masked/{images,labels,train_sN.txt,data_sN.yaml})
+Usage: python src/mask_ignore.py --stride 3 [--splits train val --out data/yolo_masked_tv]   (writes {images,labels,train_sN.txt,data_sN.yaml})
 """
 import argparse
 from multiprocessing import Pool
@@ -18,8 +18,9 @@ from common import CLASSES, DATA
 ap = argparse.ArgumentParser()
 ap.add_argument("--stride", type=int, default=3)
 ap.add_argument("--out", default=str(DATA.parent / "yolo_masked"))
+ap.add_argument("--splits", nargs="+", default=["train"], choices=["train", "val"], help="add val for the final train+val model")
 a = ap.parse_args()
-OUT = Path(a.out)
+OUT = Path(a.out).resolve()  # absolute: Ultralytics resolves relative yaml paths against the dataset dir
 
 
 def regions(p):  # normalized cx cy w h lines -> list of (x0, y0, x1, y1) normalized
@@ -34,12 +35,13 @@ def inside_frac(b, r):  # share of box b's area inside region r
     return ix * iy / max((b[2] - b[0]) * (b[3] - b[1]), 1e-12)
 
 
-def work(img):
+def work(item):
+    split, img = item
     vid, name = img.parent.name, img.stem
     dst_img, dst_lab = OUT / "images" / vid / img.name, OUT / "labels" / vid / f"{name}.txt"
     dst_img.parent.mkdir(parents=True, exist_ok=True); dst_lab.parent.mkdir(parents=True, exist_ok=True)
-    regs = regions(DATA / "train" / "ignore" / vid / f"{name}.txt")
-    src_lab = DATA / "train" / "labels" / vid / f"{name}.txt"
+    regs = regions(DATA / split / "ignore" / vid / f"{name}.txt")
+    src_lab = DATA / split / "labels" / vid / f"{name}.txt"
     lines, kept = (src_lab.read_text().splitlines() if src_lab.exists() else []), []
     for l in lines:
         c, cx, cy, w, h = l.split(); cx, cy, w, h = map(float, (cx, cy, w, h))
@@ -60,13 +62,16 @@ def work(img):
 
 
 if __name__ == "__main__":
-    imgs = []
-    for vid in sorted((DATA / "train" / "images").iterdir()):
-        imgs += sorted(vid.glob("*.jpg"))[::a.stride]  # same subsampling as prepare.py
+    items = []
+    for split in a.splits:
+        for vid in sorted((DATA / split / "images").iterdir()):
+            items += [(split, f) for f in sorted(vid.glob("*.jpg"))[::a.stride]]  # same subsampling as prepare.py
     with Pool() as p:
-        res = p.map(work, imgs, chunksize=32)
-    (OUT / f"train_s{a.stride}.txt").write_text("\n".join(str(OUT / "images" / i.parent.name / i.name) for i in imgs))
-    (OUT / f"data_s{a.stride}.yaml").write_text(
-        f"path: {OUT}\ntrain: train_s{a.stride}.txt\nval: {Path(a.out).parent / 'yolo' / 'val_s4.txt'}\nnames:\n"
+        res = p.map(work, items, chunksize=32)
+    name = "train" if a.splits == ["train"] else "trainval"
+    (OUT / f"{name}_s{a.stride}.txt").write_text("\n".join(str(OUT / "images" / i.parent.name / i.name) for _, i in items))
+    (OUT / f"data{'' if name == 'train' else '_trainval'}_s{a.stride}.yaml").write_text(
+        f"path: {OUT}\ntrain: {name}_s{a.stride}.txt\nval: {OUT.parent / 'yolo' / 'val_s4.txt'}\nnames:\n"
         + "".join(f"  {i}: {n}\n" for i, n in enumerate(CLASSES)))
-    print(f"{len(imgs)} frames, {sum(r[1] for r in res)} masked, {sum(r[0] for r in res)} labels dropped -> {OUT}")
+    print(f"{len(items)} frames ({'+'.join(a.splits)}), {sum(r[1] for r in res)} masked, "
+          f"{sum(r[0] for r in res)} labels dropped -> {OUT}")

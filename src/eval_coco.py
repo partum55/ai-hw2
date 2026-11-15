@@ -23,9 +23,15 @@ ap.add_argument("--iou", type=float, default=0.6)     # NMS IoU
 ap.add_argument("--split", default="val")
 ap.add_argument("--tag", default="eval")
 ap.add_argument("--bs", type=int, default=16, help="inference chunk size; lower it for heavy models / small GPUs")
+ap.add_argument("--multi-label", action="store_true", help="NMS keeps several classes per box (as Ultralytics val does; predict() default keeps only the argmax class)")
+ap.add_argument("--tta", action="store_true", help="Ultralytics test-time augmentation (flip + 3 scales); YOLO only")
 ap.add_argument("--arch", default="yolo", choices=["yolo", "rtdetr"])
 ap.add_argument("--limit", type=int, default=0, help="debug: evaluate only the first N frames")
 a = ap.parse_args()
+if a.multi_label:  # predict() calls nms.non_max_suppression without multi_label; val() passes multi_label=True
+    import functools
+    from ultralytics.utils import nms
+    nms.non_max_suppression = functools.partial(nms.non_max_suppression, multi_label=True)
 
 gt = COCO(str(DATA / a.split / "annotations_coco.json"))
 img_ids = sorted(gt.getImgIds())[: a.limit or None]
@@ -34,7 +40,7 @@ model, B, dets = (RTDETR if a.arch == "rtdetr" else YOLO)(a.weights), a.bs, []  
 
 t0 = time.time()
 for s in range(0, len(files), B):
-    for r, iid in zip(model.predict(files[s:s + B], imgsz=a.imgsz, conf=a.conf, iou=a.iou, max_det=500, batch=B,
+    for r, iid in zip(model.predict(files[s:s + B], imgsz=a.imgsz, conf=a.conf, iou=a.iou, max_det=500, batch=B, augment=a.tta,
                                     verbose=False), img_ids[s:s + B]):
         xyxy, sc, c = r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy(), r.boxes.cls.cpu().numpy()
         dets += [dict(image_id=iid, category_id=int(k) + 1, score=float(p),
